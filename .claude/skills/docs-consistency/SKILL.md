@@ -7,7 +7,7 @@ description: Checks and fixes inconsistencies across documentation files. Use to
 
 ## 説明
 
-Logic Factory リポジトリ内の全ドキュメント（README.md, CLAUDE.md, docs/ 配下のファイル）間の整合性をチェックし、以下の問題を検出・修正します:
+リポジトリ内の全ドキュメント（README.md, CLAUDE.md, docs/ 配下のファイル）間の整合性をチェックし、以下の問題を検出・修正します:
 
 - 相互参照リンクの正確性（存在しないファイルへのリンク、タイポ）
 - ディレクトリ名・ファイル名の一貫性

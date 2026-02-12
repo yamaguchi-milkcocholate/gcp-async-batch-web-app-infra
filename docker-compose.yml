@@ -53,11 +53,40 @@ services:
         done &&
         echo 'Creating topic...' &&
         curl -X PUT http://localhost:8085/v1/projects/local-dev/topics/pdf-processing-topic &&
+        echo 'Creating subscription...' &&
+        curl -X PUT http://localhost:8085/v1/projects/local-dev/subscriptions/pdf-processing-subscription -H 'Content-Type: application/json' -d '{\"topic\": \"projects/local-dev/topics/pdf-processing-topic\", \"ackDeadlineSeconds\": 600}' &&
         echo 'Pub/Sub emulator ready' &&
         tail -f /dev/null
       "
     networks:
       - app-network
+
+  # バッチワーカー
+  worker:
+    build:
+      context: ./apps/batch-worker
+      dockerfile: Dockerfile
+    volumes:
+      # Hot Reload 対応: ソースコードをマウント
+      - ./apps/batch-worker:/app
+      # ローカルストレージをマウント
+      - ./local_storage:/app/local_storage
+    environment:
+      - STORAGE_TYPE=LOCAL
+      - LOCAL_STORAGE_PATH=./local_storage
+      - REDIS_HOST=redis
+      - REDIS_PORT=6379
+      - REDIS_DB=0
+      - PUBSUB_EMULATOR_HOST=pubsub:8085
+      - PUBSUB_SUBSCRIPTION=pdf-processing-subscription
+      - GCP_PROJECT_ID=local-dev
+    depends_on:
+      - redis
+      - pubsub
+    networks:
+      - app-network
+    deploy:
+      replicas: 3  # 3つのワーカーを並列起動
 
 networks:
   app-network:

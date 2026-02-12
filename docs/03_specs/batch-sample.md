@@ -6,10 +6,12 @@ PDF一括解析バッチ処理システムのワーカーコンポーネント�
 
 ## 2. 変更の目的
 
-- **非同期バッチ処理**: Pub/Subキューから取得したジョブを順次処理
+- **非同期バッチ処理**: Pub/Subキューから取得したジョブを並列処理（複数ワーカー）
 - **長時間処理のシミュレーション**: 実際の解析処理を想定したsleep処理によるステータス更新とモック実装
 - **リアルタイムフィードバック**: 処理中の進捗をRedisに書き込み、フロントエンドに提供
 - **結果配信**: 処理完了後の結果ファイル（JSON）をストレージに保存し、ダウンロード可能にする
+- **長時間処理への対応**: ACK期限自動延長により最大30分の処理をサポート
+- **信頼性の向上**: 失敗時のリトライなしでステータス管理を明確化
 
 ## 3. 技術スタック
 
@@ -40,9 +42,19 @@ PDF一括解析バッチ処理システムのワーカーコンポーネント�
 ```
 
 - **サブスクリプション名**: 環境変数 `PUBSUB_SUBSCRIPTION` で指定（例: `pdf-processing-subscription`）
+- **ACK期限**: 600秒（10分）に設定
 - **環境切り替え**:
   - ローカル環境: `PUBSUB_EMULATOR_HOST=localhost:8085` 経由
   - 本番環境: 実際のCloud Pub/Sub
+
+#### ACK期限の自動延長
+
+本番環境では最大30分の処理時間を想定し、ACK期限を自動延長する仕組みを実装。
+
+- **AckLeaseExtender クラス**: バックグラウンドスレッドでACK期限を延長
+- **延長間隔**: 5分（300秒）ごと
+- **延長期限**: 600秒（10分）
+- **停止**: 処理完了またはエラー時に自動停止
 
 ### 4.2. モックPDF処理
 
@@ -143,7 +155,9 @@ JSON形式で以下の情報を含む:
 ### 4.6. メッセージACK
 
 - **処理成功時**: `message.ack()` で確認応答
-- **処理失敗時**: `message.nack()` で再配信を許可
+- **処理失敗時**: `message.ack()` で確認応答（**リトライなし**）
+  - 失敗したジョブは再実行せず、`failed` ステータスで終了
+  - 同じエラーでの無限リトライを防止
 
 ## 5. Docker構成
 
@@ -203,6 +217,8 @@ services:
     depends_on:
       - redis
       - pubsub
+    deploy:
+      replicas: 3  # 3つのワーカーを並列起動
 ```
 
 ## 6. コード設計
@@ -334,13 +350,66 @@ class PDFProcessor:
 
 ```python
 import json
+import threading
 import time
+from datetime import UTC, datetime
 from google.cloud import pubsub_v1
 import redis
 from loguru import logger
 from config import Settings
 from storage import get_storage_client
 from processor import PDFProcessor
+
+
+class AckLeaseExtender:
+    """ACK期限を定期的に延長するヘルパークラス.
+
+    長時間処理（30分など）でタイムアウトを防ぐため、
+    バックグラウンドスレッドで定期的にACK期限を延長する。
+    """
+
+    def __init__(
+        self, subscriber: pubsub_v1.SubscriberClient, subscription_path: str, ack_id: str
+    ) -> None:
+        self.subscriber = subscriber
+        self.subscription_path = subscription_path
+        self.ack_id = ack_id
+        self.stop_event = threading.Event()
+        self.thread: threading.Thread | None = None
+
+    def start(self) -> None:
+        """ACK期限延長スレッドを開始する."""
+        self.thread = threading.Thread(target=self._extend_loop, daemon=True)
+        self.thread.start()
+        logger.info("ACK lease extender started")
+
+    def stop(self) -> None:
+        """ACK期限延長スレッドを停止する."""
+        self.stop_event.set()
+        if self.thread:
+            self.thread.join(timeout=1)
+        logger.info("ACK lease extender stopped")
+
+    def _extend_loop(self) -> None:
+        """ACK期限を定期的に延長するループ（5分ごと）."""
+        while not self.stop_event.is_set():
+            # 5分（300秒）ごとに延長
+            if self.stop_event.wait(timeout=300):
+                break
+
+            try:
+                # ACK期限を600秒（10分）延長
+                self.subscriber.modify_ack_deadline(
+                    request={
+                        "subscription": self.subscription_path,
+                        "ack_ids": [self.ack_id],
+                        "ack_deadline_seconds": 600,
+                    }
+                )
+                logger.debug(f"Extended ACK deadline for message {self.ack_id}")
+            except Exception as e:
+                logger.error(f"Failed to extend ACK deadline: {e}")
+
 
 def main():
     settings = Settings()
@@ -377,7 +446,16 @@ def main():
                 message_data = received_message.message.data.decode("utf-8")
                 logger.info(f"Received message: {message_data}")
 
+                job_id: str | None = None
+                # ACK期限延長スレッド（30分の処理に対応）
+                ack_extender = AckLeaseExtender(
+                    subscriber, subscription_path, received_message.ack_id
+                )
+
                 try:
+                    # ACK期限延長を開始
+                    ack_extender.start()
+
                     # メッセージパース
                     message_dict = json.loads(message_data)
                     job_id = message_dict["job_id"]
@@ -401,28 +479,34 @@ def main():
                     logger.error(f"Error processing message: {e}", exc_info=True)
 
                     # エラーステータスをRedisに記録
-                    try:
-                        job_key = f"job:{job_id}"
-                        error_status = {
-                            "status": "failed",
-                            "progress": 0,
-                            "message": "Error occurred",
-                            "result_url": "",
-                            "error_msg": str(e),
-                            "updated_at": datetime.now(UTC).isoformat(),
-                        }
-                        redis_client.set(job_key, json.dumps(error_status))
-                    except Exception as redis_error:
-                        logger.error(f"Failed to update error status in Redis: {redis_error}")
+                    if job_id:
+                        try:
+                            job_key = f"job:{job_id}"
+                            error_status = {
+                                "status": "failed",
+                                "progress": 0,
+                                "message": "Error occurred",
+                                "result_url": "",
+                                "error_msg": str(e),
+                                "updated_at": datetime.now(UTC).isoformat(),
+                            }
+                            redis_client.set(job_key, json.dumps(error_status))
+                        except Exception as redis_error:
+                            logger.error(f"Failed to update error status in Redis: {redis_error}")
 
-                    # NACK送信（再配信）
-                    subscriber.modify_ack_deadline(
+                    # ACK送信（リトライしない）
+                    # 1度失敗したジョブは再実行せず、failedステータスで終了
+                    subscriber.acknowledge(
                         request={
                             "subscription": subscription_path,
                             "ack_ids": [received_message.ack_id],
-                            "ack_deadline_seconds": 0,
                         }
                     )
+                    logger.warning(f"Job {job_id} failed and will not be retried")
+
+                finally:
+                    # ACK期限延長スレッドを停止
+                    ack_extender.stop()
 
         except Exception as e:
             logger.error(f"Error in main loop: {e}", exc_info=True)
@@ -436,40 +520,55 @@ if __name__ == "__main__":
 
 ### 7.1. ローカル開発環境での動作確認
 
-1. **サブスクリプション作成**（Pub/Subエミュレータ）:
+1. **サブスクリプション作成**（docker-compose.ymlで自動作成）:
 
-```bash
-# Pub/Subエミュレータに接続
-export PUBSUB_EMULATOR_HOST=localhost:8085
+`docker-compose.yml`のpubsubサービスで自動的にトピックとサブスクリプションを作成：
 
-# サブスクリプション作成
-curl -X PUT "http://localhost:8085/v1/projects/local-dev/subscriptions/pdf-processing-subscription" \
-  -H "Content-Type: application/json" \
-  -d '{
-    "topic": "projects/local-dev/topics/pdf-processing-topic"
-  }'
+```yaml
+# ACK期限600秒で作成
+curl -X PUT http://localhost:8085/v1/projects/local-dev/subscriptions/pdf-processing-subscription \
+  -H 'Content-Type: application/json' \
+  -d '{"topic": "projects/local-dev/topics/pdf-processing-topic", "ackDeadlineSeconds": 600}'
 ```
 
-2. **Docker Composeでワーカー起動**:
+2. **Docker Composeで全サービス起動**:
 
 ```bash
-docker compose up worker
+docker compose up -d
 ```
+
+3つのワーカーが並列起動されます。
 
 3. **Streamlitからジョブ投入**:
    - ブラウザで `http://localhost:8501` にアクセス
    - PDFファイルをアップロードして「解析開始」ボタンをクリック
 
-4. **ワーカーログ確認**:
+4. **ワーカーログ確認**（全ワーカー）:
 
 ```bash
 docker compose logs -f worker
 ```
 
-5. **進捗表示確認**:
+5. **並列処理の確認**:
+
+複数のPDFを投入して、3つのワーカーが同時に処理することを確認：
+
+```bash
+# 5つのジョブを投入
+for i in 1 2 3 4 5; do
+  curl -X POST http://localhost:8085/v1/projects/local-dev/topics/pdf-processing-topic:publish \
+    -H 'Content-Type: application/json' \
+    -d "{\"messages\": [{\"data\": \"$(echo '{\"job_id\":\"test-'$i'\",\"pdf_path\":\"test.pdf\"}' | base64)\"}]}"
+done
+
+# 並列処理を確認
+docker compose logs worker | grep "Processing job"
+```
+
+6. **進捗表示確認**:
    - Streamlit UIで進捗バーとメッセージが2秒ごとに更新されることを確認
 
-6. **結果ファイル確認**:
+7. **結果ファイル確認**:
 
 ```bash
 cat local_storage/results/{job_id}/result.json
@@ -484,15 +583,24 @@ GET job:{job_id}
 
 ## 8. 非機能要件
 
-- **スケーラビリティ**: 複数ワーカーコンテナを起動して並列処理可能
-- **冪等性**: 同じメッセージを複数回受信しても結果が変わらない設計
-- **エラーハンドリング**: 例外発生時のNACKと再配信
+- **スケーラビリティ**: 複数ワーカーコンテナを起動して並列処理（デフォルト3並列）
+  - `docker compose up -d --scale worker=5` でワーカー数を動的に変更可能
+- **長時間処理**: ACK期限自動延長により最大30分以上の処理に対応
+- **信頼性**: 失敗時のリトライなしで無限ループを防止
+- **冪等性**: 同じメッセージを複数回受信しても結果が変わらない設計（リトライなしで実現）
+- **エラーハンドリング**: 例外発生時もACK送信でジョブを完了、Redisにfailedステータスを記録
 - **ログ出力**: `loguru` で構造化ログを出力（INFO, ERROR レベル）
 - **タイムアウト**: 本番環境ではCloud Run Jobsのタイムアウトを1800秒（30分）に設定
 
-## 9. 今後の拡張
+## 9. 実装済みの機能
+
+- ✅ **並列処理**: 複数ワーカーによる負荷分散（replicas: 3）
+- ✅ **長時間処理対応**: ACK期限自動延長（AckLeaseExtender）
+- ✅ **信頼性向上**: 失敗時のリトライなしで無限ループ防止
+
+## 10. 今後の拡張
 
 - **実際のPDF解析**: PyPDF2やpdfplumber、LLM APIを使用した本格的な解析
-- **リトライポリシー**: Pub/Subのデッドレターキュー設定
-- **並列処理**: 複数ワーカーによる負荷分散
+- **デッドレターキュー**: 完全に処理できないメッセージの隔離（現状はリトライなしで対応）
 - **優先度キュー**: 緊急ジョブの優先処理
+- **メトリクス収集**: 処理時間、成功率などの監視
