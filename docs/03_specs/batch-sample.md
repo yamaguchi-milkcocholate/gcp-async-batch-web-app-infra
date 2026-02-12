@@ -87,6 +87,12 @@ PDF一括解析バッチ処理システムのワーカーコンポーネント�
 job:{job_id}
 ```
 
+#### TTL（有効期限）
+
+- **設定値**: 24時間（86400秒）
+- **目的**: 古いジョブデータの自動削除、過去24時間のジョブ履歴管理
+- **実装**: Redisの `SETEX` コマンド、または `SET` + `EXPIRE` コマンドで設定
+
 #### データ構造
 
 ```json
@@ -108,6 +114,8 @@ job:{job_id}
 | **各ページ処理後** | `processing` | 計算値   | "Page X/Y analyzing..." | `""`       | `""`             |
 | **処理完了時**     | `completed`  | 100      | "Processing completed!" | 結果パス   | `""`             |
 | **エラー発生時**   | `failed`     | 停止時点 | "Error occurred"        | `""`       | エラーメッセージ |
+
+**重要:** 各更新時にTTLを再設定し、24時間の有効期限を維持する。
 
 ### 4.4. 結果ファイル生成
 
@@ -333,7 +341,7 @@ class PDFProcessor:
         result_url: str = "",
         error_msg: str = "",
     ) -> None:
-        """Redisにステータスを書き込む"""
+        """Redisにステータスを書き込む（TTL: 24時間）"""
         job_key = f"job:{self.job_id}"
         status_data = {
             "status": status,
@@ -343,7 +351,8 @@ class PDFProcessor:
             "error_msg": error_msg,
             "updated_at": datetime.now(UTC).isoformat(),
         }
-        self.redis_client.set(job_key, json.dumps(status_data))
+        # TTL 24時間（86400秒）を設定
+        self.redis_client.setex(job_key, 86400, json.dumps(status_data))
 ```
 
 #### `worker.py` - メインワーカー
@@ -478,7 +487,7 @@ def main():
                 except Exception as e:
                     logger.error(f"Error processing message: {e}", exc_info=True)
 
-                    # エラーステータスをRedisに記録
+                    # エラーステータスをRedisに記録（TTL: 24時間）
                     if job_id:
                         try:
                             job_key = f"job:{job_id}"
@@ -490,7 +499,7 @@ def main():
                                 "error_msg": str(e),
                                 "updated_at": datetime.now(UTC).isoformat(),
                             }
-                            redis_client.set(job_key, json.dumps(error_status))
+                            redis_client.setex(job_key, 86400, json.dumps(error_status))
                         except Exception as redis_error:
                             logger.error(f"Failed to update error status in Redis: {redis_error}")
 

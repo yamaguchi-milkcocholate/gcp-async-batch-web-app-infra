@@ -161,7 +161,7 @@ def main() -> None:
                 except Exception as e:
                     logger.error(f"Error processing message: {e}", exc_info=True)
 
-                    # エラーステータスをRedisに記録
+                    # エラーステータスをRedisに記録（TTL: 24時間）
                     if job_id:
                         try:
                             job_key = f"job:{job_id}"
@@ -173,7 +173,8 @@ def main() -> None:
                                 "error_msg": str(e),
                                 "updated_at": datetime.now(UTC).isoformat(),
                             }
-                            redis_client.set(job_key, json.dumps(error_status))
+                            # TTL 24時間（86400秒）を設定
+                            redis_client.setex(job_key, 86400, json.dumps(error_status))
                             logger.info(f"Error status saved to Redis for job {job_id}")
                         except Exception as redis_error:
                             logger.error(f"Failed to update error status in Redis: {redis_error}")

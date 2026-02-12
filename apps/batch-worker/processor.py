@@ -99,7 +99,7 @@ class PDFProcessor:
         result_url: str = "",
         error_msg: str = "",
     ) -> None:
-        """Redisにステータスを書き込む.
+        """Redisにステータスを書き込む（TTL: 24時間）.
 
         Args:
             status: ステータス（processing, completed, failed）
@@ -117,5 +117,6 @@ class PDFProcessor:
             "error_msg": error_msg,
             "updated_at": datetime.now(UTC).isoformat(),
         }
-        self.redis_client.set(job_key, json.dumps(status_data))
+        # TTL 24時間（86400秒）を設定
+        self.redis_client.setex(job_key, 86400, json.dumps(status_data))
         logger.debug(f"[{self.job_id}] Status updated: {status} ({progress}%)")
