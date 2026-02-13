@@ -1,6 +1,7 @@
 resource "google_cloud_run_v2_service" "batch_worker" {
-  name     = var.service_name
-  location = var.region
+  name               = var.service_name
+  location           = var.region
+  deletion_protection = false
 
   template {
     containers {
