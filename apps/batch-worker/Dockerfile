@@ -23,5 +23,6 @@ RUN uv pip install --system -r pyproject.toml
 # アプリケーションコードをコピー
 COPY . .
 
-# エントリーポイント
-CMD ["python", "worker.py"]
+# エントリーポイント（gunicorn でFlaskアプリを起動）
+# Cloud Runの環境変数 PORT (デフォルト8080) でリッスン
+CMD exec gunicorn --bind :$PORT --workers 1 --threads 8 --timeout 1800 worker:app

@@ -9,6 +9,8 @@ dependencies = [
     "google-cloud-storage>=2.18.0",
     "pydantic-settings>=2.6.0",
     "loguru>=0.7.0",
+    "flask>=3.1.0",
+    "gunicorn>=23.0.0",
 ]
 
 [build-system]
